@@ -1,33 +1,73 @@
-const express = require("express");
-const http = require("http");
-const socketIO = require("socket.io");
-const cors = require("cors");
+const express = require('express');
+const http = require('http');
+const socketIo = require('socket.io');
+const cors = require('cors');
 
 const app = express();
 app.use(cors());
+
 const server = http.createServer(app);
-const io = socketIO(server, {
-  cors: { origin: "*" }
+const io = socketIo(server, {
+  cors: {
+    origin: "*",
+    methods: ["GET", "POST"]
+  }
 });
 
-io.on("connection", (socket) => {
-  console.log("New client connected:", socket.id);
+// Store room data
+const rooms = new Map();
 
-  socket.on("offer", (data) => {
-    socket.broadcast.emit("offer", data);
+io.on('connection', (socket) => {
+  console.log(`User connected: ${socket.id}`);
+
+  // Join a room
+  socket.on('join-room', (roomId, userId) => {
+    socket.join(roomId);
+    console.log(`User ${userId} joined room ${roomId}`);
+    
+    // Add user to room
+    if (!rooms.has(roomId)) {
+      rooms.set(roomId, new Set());
+    }
+    rooms.get(roomId).add(userId);
+    
+    // Broadcast to others in the room that a new user has joined
+    socket.to(roomId).emit('user-connected', userId);
+    
+    // Send current users in the room to the new user
+    socket.emit('current-users', Array.from(rooms.get(roomId)));
   });
 
-  socket.on("answer", (data) => {
-    socket.broadcast.emit("answer", data);
+  // WebRTC signaling
+  socket.on('offer', (userId, offer, roomId) => {
+    socket.to(roomId).emit('offer', userId, offer);
   });
 
-  socket.on("ice-candidate", (data) => {
-    socket.broadcast.emit("ice-candidate", data);
+  socket.on('answer', (userId, answer, roomId) => {
+    socket.to(roomId).emit('answer', userId, answer);
   });
 
-  socket.on("disconnect", () => {
-    console.log("Client disconnected:", socket.id);
+  socket.on('ice-candidate', (userId, candidate, roomId) => {
+    socket.to(roomId).emit('ice-candidate', userId, candidate);
+  });
+
+  // Handle user disconnection
+  socket.on('disconnect', () => {
+    console.log(`User disconnected: ${socket.id}`);
+    // Find and remove user from all rooms
+    rooms.forEach((users, roomId) => {
+      if (users.has(socket.id)) {
+        users.delete(socket.id);
+        socket.to(roomId).emit('user-disconnected', socket.id);
+        if (users.size === 0) {
+          rooms.delete(roomId);
+        }
+      }
+    });
   });
 });
 
-server.listen(5000, () => console.log("Server running on port 5000"));
+const PORT = process.env.PORT || 5000;
+server.listen(PORT, () => {
+  console.log(`Server running on port ${PORT}`);
+});
