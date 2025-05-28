@@ -198,17 +198,6 @@ function Meeting() {
     }
   };
 
-  const handleUserDisconnected = (remoteUserId) => {
-    console.log(`User disconnected: ${remoteUserId}`);
-    if (peerConnections.current[remoteUserId]) {
-      peerConnections.current[remoteUserId].close();
-      delete peerConnections.current[remoteUserId];
-    }
-    
-    setRemoteStreams(prev => prev.filter(stream => stream.userId !== remoteUserId));
-    setCurrentUsers(prev => prev.filter(id => id !== remoteUserId));
-  };
-
   const handleOffer = async ({ senderId, offer }) => {
     if (senderId === userId.current) return;
 
@@ -269,8 +258,45 @@ function Meeting() {
     });
   };
 
+  const cleanupDisconnectedUser = (remoteUserId) => {
+    console.log(`Cleaning up disconnected user: ${remoteUserId}`);
+    
+    // Close the peer connection if it exists
+    if (peerConnections.current[remoteUserId]) {
+      peerConnections.current[remoteUserId].close();
+      delete peerConnections.current[remoteUserId];
+    }
+    
+    // Remove from remote streams
+    setRemoteStreams(prev => prev.filter(stream => stream.userId !== remoteUserId));
+    
+    // Remove from current users list
+    setCurrentUsers(prev => prev.filter(id => id !== remoteUserId));
+    
+    // Remove from connection status
+    setConnectionStatus(prev => {
+      const newStatus = { ...prev };
+      delete newStatus[remoteUserId];
+      return newStatus;
+    });
+  };
+
+  const handleUserDisconnected = (remoteUserId) => {
+    console.log(`Handling disconnection for user: ${remoteUserId}`);
+    cleanupDisconnectedUser(remoteUserId);
+  };
+
   useEffect(() => {
     socketRef.current = io('http://localhost:5000');
+
+    // Add beforeunload event listener to notify others when leaving
+    const handleBeforeUnload = () => {
+      if (socketRef.current.connected) {
+        socketRef.current.emit('leave-room', roomId, userId.current);
+      }
+    };
+    
+    window.addEventListener('beforeunload', handleBeforeUnload);
 
     navigator.mediaDevices.getUserMedia({ video: true, audio: true })
       .then(stream => {
@@ -279,27 +305,67 @@ function Meeting() {
           localVideoRef.current.srcObject = stream;
         }
 
+        // Join the room
         socketRef.current.emit('join-room', roomId, userId.current);
 
+        // Socket event listeners
         socketRef.current.on('user-connected', handleUserConnected);
         socketRef.current.on('user-disconnected', handleUserDisconnected);
         socketRef.current.on('current-users', handleCurrentUsers);
         socketRef.current.on('offer', handleOffer);
         socketRef.current.on('answer', handleAnswer);
         socketRef.current.on('ice-candidate', handleIceCandidate);
+        
+        // Add listener for force-disconnect (when server detects a disconnect)
+        socketRef.current.on('force-disconnect', (disconnectedUserId) => {
+          if (disconnectedUserId !== userId.current) {
+            handleUserDisconnected(disconnectedUserId);
+          }
+        });
       })
       .catch(error => {
         console.error('Error accessing media devices:', error);
       });
 
     return () => {
+      // Cleanup function
       if (localStream) {
         localStream.getTracks().forEach(track => track.stop());
       }
-      socketRef.current.disconnect();
+      
+      // Notify server we're leaving if socket is still connected
+      if (socketRef.current.connected) {
+        socketRef.current.emit('leave-room', roomId, userId.current);
+      }
+      
+      // Close all peer connections
       Object.values(peerConnections.current).forEach(pc => pc.close());
+      
+      // Disconnect socket
+      socketRef.current.disconnect();
+      
+      // Remove beforeunload listener
+      window.removeEventListener('beforeunload', handleBeforeUnload);
     };
   }, [roomId]);
+
+  const leaveCall = () => {
+    // Notify server we're leaving
+    if (socketRef.current.connected) {
+      socketRef.current.emit('leave-room', roomId, userId.current);
+    }
+    
+    // Close all peer connections
+    Object.values(peerConnections.current).forEach(pc => pc.close());
+    
+    // Stop local media tracks
+    if (localStream) {
+      localStream.getTracks().forEach(track => track.stop());
+    }
+    
+    // Navigate away
+    window.location.href = '/';
+  };
 
   const toggleMute = () => {
     if (localStream) {
@@ -317,10 +383,6 @@ function Meeting() {
       });
       setIsVideoOff(!isVideoOff);
     }
-  };
-
-  const leaveCall = () => {
-    window.location.href = '/';
   };
 
   // Combine all user IDs (current user + remote users)
