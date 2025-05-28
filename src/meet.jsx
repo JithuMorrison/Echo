@@ -25,11 +25,13 @@ const ParticipantsList = styled.div`
   gap: 0.5rem;
   align-items: center;
   font-size: 0.9rem;
+  flex-wrap: wrap;
 
   span {
     background: rgba(255, 255, 255, 0.1);
     padding: 4px 8px;
     border-radius: 4px;
+    margin: 2px;
   }
 `;
 
@@ -47,12 +49,14 @@ const VideoWrapper = styled.div`
   background: #3c4043;
   border-radius: 8px;
   overflow: hidden;
+  min-height: 200px;
 `;
 
 const Video = styled.video`
   width: 100%;
   height: 100%;
   object-fit: cover;
+  background: #000;
 `;
 
 const UserName = styled.div`
@@ -119,7 +123,7 @@ function Meeting() {
 
     peerConnections.current[remoteUserId] = peerConnection;
 
-    // Add local stream to peer connection
+    // Add local stream to peer connection if available
     if (localStream) {
       localStream.getTracks().forEach(track => {
         peerConnection.addTrack(track, localStream);
@@ -128,45 +132,42 @@ function Meeting() {
 
     // Handle remote stream
     peerConnection.ontrack = (event) => {
+      console.log(`Received track from ${remoteUserId}`);
       setRemoteStreams(prev => {
-        // Check if we already have this stream
-        const existingIndex = prev.findIndex(stream => stream.userId === remoteUserId);
+        const existingStream = prev.find(stream => stream.userId === remoteUserId);
+        if (existingStream) return prev;
         
-        if (existingIndex >= 0) {
-          // Update existing stream
-          const updated = [...prev];
-          updated[existingIndex] = { userId: remoteUserId, stream: event.streams[0] };
-          return updated;
-        } else {
-          // Add new stream
-          return [...prev, { userId: remoteUserId, stream: event.streams[0] }];
-        }
+        return [...prev, { userId: remoteUserId, stream: event.streams[0] }];
       });
-
-      // Set the stream to the video element
-      if (remoteVideoRefs.current[remoteUserId]) {
-        remoteVideoRefs.current[remoteUserId].srcObject = event.streams[0];
-      }
     };
 
     // ICE candidate handling
     peerConnection.onicecandidate = (event) => {
       if (event.candidate) {
-        socketRef.current.emit('ice-candidate', userId.current, event.candidate, roomId);
+        socketRef.current.emit('ice-candidate', {
+          senderId: userId.current,
+          receiverId: remoteUserId,
+          candidate: event.candidate,
+          roomId
+        });
       }
     };
 
     // Connection state tracking
     peerConnection.onconnectionstatechange = () => {
+      const state = peerConnection.connectionState;
       setConnectionStatus(prev => ({
         ...prev,
-        [remoteUserId]: peerConnection.connectionState
+        [remoteUserId]: state
       }));
+      
+      if (state === 'disconnected' || state === 'failed') {
+        handleUserDisconnected(remoteUserId);
+      }
     };
 
     peerConnection.oniceconnectionstatechange = () => {
       if (peerConnection.iceConnectionState === 'failed') {
-        console.log(`ICE failed with ${remoteUserId}, attempting restart...`);
         peerConnection.restartIce();
       }
     };
@@ -178,12 +179,20 @@ function Meeting() {
     if (remoteUserId === userId.current) return;
 
     console.log(`New user connected: ${remoteUserId}`);
+    setCurrentUsers(prev => [...new Set([...prev, remoteUserId])]);
+    
     const peerConnection = createPeerConnection(remoteUserId);
 
     try {
       const offer = await peerConnection.createOffer();
       await peerConnection.setLocalDescription(offer);
-      socketRef.current.emit('offer', userId.current, offer, roomId);
+      
+      socketRef.current.emit('offer', {
+        senderId: userId.current,
+        receiverId: remoteUserId,
+        offer,
+        roomId
+      });
     } catch (error) {
       console.error('Error creating offer:', error);
     }
@@ -198,33 +207,35 @@ function Meeting() {
     
     setRemoteStreams(prev => prev.filter(stream => stream.userId !== remoteUserId));
     setCurrentUsers(prev => prev.filter(id => id !== remoteUserId));
-    
-    setConnectionStatus(prev => {
-      const newStatus = { ...prev };
-      delete newStatus[remoteUserId];
-      return newStatus;
-    });
   };
 
-  const handleOffer = async (remoteUserId, offer) => {
-    if (remoteUserId === userId.current) return;
+  const handleOffer = async ({ senderId, offer }) => {
+    if (senderId === userId.current) return;
 
-    console.log(`Received offer from ${remoteUserId}`);
-    const peerConnection = createPeerConnection(remoteUserId);
+    console.log(`Received offer from ${senderId}`);
+    setCurrentUsers(prev => [...new Set([...prev, senderId])]);
+    
+    const peerConnection = createPeerConnection(senderId);
 
     try {
       await peerConnection.setRemoteDescription(new RTCSessionDescription(offer));
       const answer = await peerConnection.createAnswer();
       await peerConnection.setLocalDescription(answer);
-      socketRef.current.emit('answer', userId.current, answer, roomId);
+      
+      socketRef.current.emit('answer', {
+        senderId: userId.current,
+        receiverId: senderId,
+        answer,
+        roomId
+      });
     } catch (error) {
       console.error('Error handling offer:', error);
     }
   };
 
-  const handleAnswer = async (remoteUserId, answer) => {
-    console.log(`Received answer from ${remoteUserId}`);
-    const peerConnection = peerConnections.current[remoteUserId];
+  const handleAnswer = async ({ senderId, answer }) => {
+    console.log(`Received answer from ${senderId}`);
+    const peerConnection = peerConnections.current[senderId];
     if (peerConnection) {
       try {
         await peerConnection.setRemoteDescription(new RTCSessionDescription(answer));
@@ -234,8 +245,8 @@ function Meeting() {
     }
   };
 
-  const handleIceCandidate = async (remoteUserId, candidate) => {
-    const peerConnection = peerConnections.current[remoteUserId];
+  const handleIceCandidate = async ({ senderId, candidate }) => {
+    const peerConnection = peerConnections.current[senderId];
     if (peerConnection) {
       try {
         await peerConnection.addIceCandidate(new RTCIceCandidate(candidate));
@@ -247,21 +258,20 @@ function Meeting() {
 
   const handleCurrentUsers = (users) => {
     console.log('Current users in room:', users);
-    setCurrentUsers(users);
+    const filteredUsers = users.filter(id => id !== userId.current);
+    setCurrentUsers(filteredUsers);
     
     // Create connections to all existing users
-    users.forEach(existingUserId => {
-      if (existingUserId !== userId.current) {
+    filteredUsers.forEach(existingUserId => {
+      if (!peerConnections.current[existingUserId]) {
         handleUserConnected(existingUserId);
       }
     });
   };
 
   useEffect(() => {
-    // Initialize socket connection
     socketRef.current = io('http://localhost:5000');
 
-    // Get user media
     navigator.mediaDevices.getUserMedia({ video: true, audio: true })
       .then(stream => {
         setLocalStream(stream);
@@ -269,10 +279,8 @@ function Meeting() {
           localVideoRef.current.srcObject = stream;
         }
 
-        // Join the room
         socketRef.current.emit('join-room', roomId, userId.current);
 
-        // Setup socket listeners
         socketRef.current.on('user-connected', handleUserConnected);
         socketRef.current.on('user-disconnected', handleUserDisconnected);
         socketRef.current.on('current-users', handleCurrentUsers);
@@ -285,7 +293,6 @@ function Meeting() {
       });
 
     return () => {
-      // Cleanup
       if (localStream) {
         localStream.getTracks().forEach(track => track.stop());
       }
@@ -316,38 +323,81 @@ function Meeting() {
     window.location.href = '/';
   };
 
+  // Combine all user IDs (current user + remote users)
+  const allUserIds = [userId.current, ...currentUsers];
+
   return (
     <Container>
       <RoomInfo>
         <div>Room ID: {roomId}</div>
         <ParticipantsList>
-          <span>{currentUsers.length + 1} participants</span>
-          <div>Connected Users: {[userId.current, ...currentUsers].map(id => 
-            <span key={id}>{id}</span>
-          )}</div>
+          <span>{allUserIds.length} participants</span>
+          {allUserIds.map(id => (
+            <span key={id}>
+              {id === userId.current ? 'You' : id} 
+              {connectionStatus[id] ? ` (${connectionStatus[id]})` : ''}
+            </span>
+          ))}
         </ParticipantsList>
       </RoomInfo>
       
       <VideoContainer>
         <VideoWrapper>
-          <Video ref={localVideoRef} autoPlay muted />
+          <Video 
+            ref={localVideoRef} 
+            autoPlay 
+            muted 
+            style={{ display: isVideoOff ? 'none' : 'block' }}
+          />
+          {isVideoOff && (
+            <div style={{
+              width: '100%',
+              height: '100%',
+              display: 'flex',
+              alignItems: 'center',
+              justifyContent: 'center',
+              background: '#000',
+              color: '#fff'
+            }}>
+              Camera is off
+            </div>
+          )}
           <UserName>You ({userId.current})</UserName>
         </VideoWrapper>
         
-        {remoteStreams.map(({ userId: remoteUserId, stream }) => (
-          <VideoWrapper key={remoteUserId}>
-            <Video
-              autoPlay
-              ref={el => {
-                remoteVideoRefs.current[remoteUserId] = el;
-                if (el) el.srcObject = stream;
-              }}
-            />
-            <UserName>
-              {remoteUserId} ({connectionStatus[remoteUserId] || 'connecting'})
-            </UserName>
-          </VideoWrapper>
-        ))}
+        {currentUsers.map(remoteUserId => {
+          const remoteStream = remoteStreams.find(s => s.userId === remoteUserId);
+          return (
+            <VideoWrapper key={remoteUserId}>
+              {remoteStream ? (
+                <Video
+                  autoPlay
+                  ref={el => {
+                    if (el) {
+                      remoteVideoRefs.current[remoteUserId] = el;
+                      el.srcObject = remoteStream.stream;
+                    }
+                  }}
+                />
+              ) : (
+                <div style={{
+                  width: '100%',
+                  height: '100%',
+                  display: 'flex',
+                  alignItems: 'center',
+                  justifyContent: 'center',
+                  background: '#000',
+                  color: '#fff'
+                }}>
+                  Connecting...
+                </div>
+              )}
+              <UserName>
+                {remoteUserId} ({connectionStatus[remoteUserId] || 'connecting'})
+              </UserName>
+            </VideoWrapper>
+          );
+        })}
       </VideoContainer>
       
       <Controls>
